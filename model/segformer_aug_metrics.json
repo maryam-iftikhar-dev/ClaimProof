@@ -1,0 +1,13 @@
+{
+  "model": "nvidia/mit-b2",
+  "augmentation": true,
+  "best_epoch": 20,
+  "best_val_auc": 0.9925,
+  "test_auc": 0.9945,
+  "photo_threshold_5pct_false_alarms": 0.2356,
+  "test_detection_rate": 0.9735,
+  "test_false_alarm_rate": 0.0165,
+  "pixel_threshold_chosen_on_val": 0.3,
+  "test_pixel_F1_mean_per_edited_photo": 0.8618,
+  "test_pixel_F1_all_edited_pixels": 0.8851
+}
