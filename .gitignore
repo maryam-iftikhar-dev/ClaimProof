@@ -8,3 +8,5 @@ analyst_feedback/*
 !analyst_feedback/.gitkeep
 # Trained model checkpoints
 model/*.pt
+
+config/credits.json

@@ -2,7 +2,7 @@ const $ = (id) => document.getElementById(id);
 let selectedFile = null;
 let latestResult = null;
 let toastTimer;
-function toast(message){const el=$('toast');el.textContent=message;el.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('show'),3200);}
+function toast(message,ms=3200){const el=$('toast');el.textContent=message;el.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('show'),ms);}
 function showPage(name){['landing','login','dashboard'].forEach(id=>$(id).classList.toggle('hidden',id!==name));window.scrollTo(0,0);}
 async function api(url,options={}){const res=await fetch(url,{credentials:'same-origin',...options});let data={};try{data=await res.json();}catch{}if(!res.ok)throw new Error(data.error||data.detail||`Request failed (${res.status})`);return data;}
 function goLogin(){showPage('login');}
@@ -10,7 +10,7 @@ document.querySelectorAll('[data-go-login]').forEach(b=>b.addEventListener('clic
 $('toggle-password').addEventListener('click',()=>{const p=$('password');p.type=p.type==='password'?'text':'password';$('toggle-password').textContent=p.type==='password'?'Show':'Hide';});
 document.querySelectorAll('[data-copy]').forEach(b=>b.addEventListener('click',async()=>{try{await navigator.clipboard.writeText(b.dataset.copy);toast('Copied to clipboard.');}catch{toast('Copy is unavailable in this browser.');}}));
 $('login-form').addEventListener('submit',async e=>{e.preventDefault();$('login-error').textContent='';const button=e.submitter;button.disabled=true;try{const data=await api('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('username').value.trim(),password:$('password').value})});enterDashboard(data.user);}catch(err){$('login-error').textContent=err.message;}finally{button.disabled=false;}});
-function enterDashboard(user){$('sidebar-user').textContent=user.displayName||user.username;$('username').value='';$('password').value='';showPage('dashboard');checkService();loadExamples();}
+function enterDashboard(user){$('sidebar-user').textContent=user.displayName||user.username;$('username').value='';$('password').value='';showPage('dashboard');checkService();loadExamples();refreshCredits();}
 $('logout').addEventListener('click',async()=>{try{await api('/api/logout',{method:'POST'});}catch{}selectedFile=null;latestResult=null;showPage('landing');});
 async function checkSession(){try{const data=await api('/api/me');if(data.user)enterDashboard(data.user);else showPage('landing');}catch{showPage('landing');}}
 async function checkService(){try{const d=await api('/api/health');$('service-status').textContent=d.inference?.model_loaded?'Model service ready':`Connected · ${d.inference?.device||'loading model'}`;}catch{$('service-status').textContent='Model service offline';}}
@@ -18,7 +18,56 @@ function setFile(file){if(!file)return;if(!['image/jpeg','image/png','image/webp
 $('browse-btn').addEventListener('click',()=>$('image-input').click());$('dropzone').addEventListener('click',e=>{if(e.target.tagName!=='BUTTON')$('image-input').click();});$('image-input').addEventListener('change',e=>setFile(e.target.files[0]));$('remove-image').addEventListener('click',()=>{selectedFile=null;$('image-input').value='';$('preview-wrap').classList.add('hidden');$('dropzone').classList.remove('hidden');$('analyze-btn').disabled=true;$('result-state').textContent='AWAITING IMAGE';});
 ['dragenter','dragover'].forEach(evt=>$('dropzone').addEventListener(evt,e=>{e.preventDefault();$('dropzone').classList.add('drag');}));['dragleave','drop'].forEach(evt=>$('dropzone').addEventListener(evt,e=>{e.preventDefault();$('dropzone').classList.remove('drag');}));$('dropzone').addEventListener('drop',e=>setFile(e.dataTransfer.files[0]));
 async function loadExamples(){try{const examples=await api('/api/examples');$('examples').innerHTML='';examples.forEach(ex=>{const btn=document.createElement('button');btn.type='button';btn.className='example-thumb';btn.title=ex.name;const img=document.createElement('img');img.src=ex.url;img.alt=ex.name;btn.appendChild(img);btn.addEventListener('click',async()=>{try{const response=await fetch(ex.url);const blob=await response.blob();setFile(new File([blob],ex.name,{type:blob.type||'image/jpeg'}));document.querySelectorAll('.example-thumb').forEach(x=>x.classList.remove('selected'));btn.classList.add('selected');}catch{toast('Could not load this sample image.');}});$('examples').appendChild(btn);});}catch{$('examples').textContent='Examples unavailable';}}
-$('analyze-btn').addEventListener('click',async()=>{if(!selectedFile)return;const btn=$('analyze-btn');btn.disabled=true;$('empty-results').classList.add('hidden');$('result-content').classList.add('hidden');$('loading-results').classList.remove('hidden');$('result-state').textContent='ANALYSING';$('decision-panel').classList.add('hidden');const form=new FormData();form.append('image',selectedFile);try{const data=await api('/api/analyze',{method:'POST',body:form});latestResult=data;renderResult(data);$('decision-panel').classList.remove('hidden');$('result-state').textContent='ANALYSIS COMPLETE';}catch(err){$('empty-results').classList.remove('hidden');$('empty-results').querySelector('b').textContent='Analysis failed';$('empty-results').querySelector('p').textContent=err.message;$('result-state').textContent='ERROR';toast(err.message);}finally{$('loading-results').classList.add('hidden');btn.disabled=false;}});
+$('analyze-btn').addEventListener('click',async()=>{if(!selectedFile)return;const btn=$('analyze-btn');btn.disabled=true;$('empty-results').classList.add('hidden');$('result-content').classList.add('hidden');$('loading-results').classList.remove('hidden');$('result-state').textContent='ANALYSING';$('decision-panel').classList.add('hidden');const form=new FormData();form.append('image',selectedFile);try{const data=await api('/api/analyze',{method:'POST',body:form});latestResult=data;renderResult(data);if(typeof data.credits_left==='number')setCredits(data.credits_left);$('decision-panel').classList.remove('hidden');$('result-state').textContent='ANALYSIS COMPLETE';}catch(err){$('empty-results').classList.remove('hidden');$('empty-results').querySelector('b').textContent='Analysis failed';$('empty-results').querySelector('p').textContent=err.message;$('result-state').textContent='ERROR';toast(err.message);}finally{$('loading-results').classList.add('hidden');btn.disabled=false;}});
 function renderResult(data){$('result-content').classList.remove('hidden');$('verdict').classList.toggle('safe',!data.flagged);$('verdict-text').textContent=data.verdict;$('score-value').textContent=Number(data.score).toFixed(2);$('threshold-value').textContent=`Decision threshold ${Number(data.threshold).toFixed(2)}`;$('heatmap').src=data.heatmap;$('reason-text').textContent=data.reason;$('region-count').textContent=`${data.regions.length} region${data.regions.length===1?'':'s'}`;const body=$('regions-body');body.innerHTML='';if(!data.regions.length){const tr=document.createElement('tr');tr.innerHTML='<td colspan="3">No suspicious regions above the display threshold.</td>';body.appendChild(tr);}else data.regions.forEach(r=>{const tr=document.createElement('tr');[r.location,`${r.area_percent}%`,Number(r.confidence).toFixed(2)].forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.appendChild(td);});body.appendChild(tr);});document.querySelectorAll('input[name="decision"]').forEach(x=>x.checked=false);$('analyst-note').value='';$('decision-message').textContent='Your assessment is saved locally in the analyst feedback folder.';}
 $('save-decision').addEventListener('click',async()=>{const decision=document.querySelector('input[name="decision"]:checked');if(!decision){toast('Select an analyst decision first.');return;}const btn=$('save-decision');btn.disabled=true;try{const data=await api('/api/decision',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision:decision.value,note:$('analyst-note').value})});$('decision-message').textContent=data.message;toast('Analyst decision saved.');}catch(err){toast(err.message);}finally{btn.disabled=false;}});
+
+// --------------------------------------------------
+// CREDITS + STRIPE CHECKOUT
+// --------------------------------------------------
+function setCredits(n){$('credits-label').textContent=`Credits: ${n}`;}
+async function refreshCredits(){try{const d=await api('/api/me');setCredits(d.credits||0);return d.credits||0;}catch{return 0;}}
+
+// The modal is toggled with inline display so it works regardless of CSS classes.
+function openPacks(){const b=$('packs-box');b.classList.remove('hidden');b.style.display='flex';}
+function closePacks(){const b=$('packs-box');b.classList.add('hidden');b.style.display='none';}
+closePacks();
+
+$('buy-credits').addEventListener('click',async()=>{
+  try{
+    const packs=await api('/api/packs');
+    const list=$('packs-list');list.innerHTML='';
+    packs.forEach(p=>{
+      const b=document.createElement('button');
+      b.type='button';b.className='btn btn-primary';
+      b.textContent=`${p.name} · PKR ${p.amountPkr}`;
+      b.addEventListener('click',async()=>{
+        b.disabled=true;
+        try{
+          const d=await api('/api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({packId:p.id})});
+          window.location.href=d.url;
+        }catch(err){toast(err.message);b.disabled=false;}
+      });
+      list.appendChild(b);
+    });
+    openPacks();
+  }catch(err){toast(err.message);}
+});
+$('close-packs').addEventListener('click',closePacks);
+$('packs-box').addEventListener('click',e=>{if(e.target===$('packs-box'))closePacks();});
+
+// Handle return from Stripe Checkout (?payment=success or ?payment=cancelled).
+// Credits are added by the webhook, which can land a second or two later, so poll briefly.
+const params=new URLSearchParams(location.search);
+const payStatus=params.get('payment');
+const paidSessionId=params.get('session_id');
+if(payStatus){history.replaceState({},'',location.pathname);}
+if(payStatus==='success'&&paidSessionId){
+  toast('Payment received. Adding your credits, please wait…',15000);
+  const label=$('credits-label');
+  label.textContent='Credits: updating…';
+  api('/api/confirm-payment',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:paidSessionId})})
+    .then(d=>{setCredits(d.credits);toast('Payment successful. Your credits have been added.',4000);})
+    .catch(err=>{console.error(err);refreshCredits();alert(err.message);});
+}else if(payStatus==='cancelled'){toast('Payment cancelled.');}
 checkSession();

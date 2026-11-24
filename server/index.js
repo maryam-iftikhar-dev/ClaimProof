@@ -1,4 +1,4 @@
-
+const Stripe = require('stripe');
 const express = require('express');
 const session = require('express-session');
 const helmet = require('helmet');
@@ -18,6 +18,60 @@ require('dotenv').config({ path: path.join(ROOT, '.env') });
 
 const PORT = process.env.PORT || 3000;
 const INFERENCE_URL = process.env.INFERENCE_URL || 'http://127.0.0.1:8001';
+
+// --------------------------------------------------
+// STRIPE + CREDITS (no database, JSON file)
+// --------------------------------------------------
+
+const stripe = process.env.STRIPE_SECRET_KEY
+    ? new Stripe(process.env.STRIPE_SECRET_KEY)
+    : null;
+
+const APP_URL = process.env.APP_URL || `http://127.0.0.1:${PORT}`;
+
+// Prices live on the server only. Never trust prices sent by the browser.
+const PACKS = {
+    pack_10: { name: '10 image analyses', credits: 10, amountPkr: 500 },
+    pack_50: { name: '50 image analyses', credits: 50, amountPkr: 2250 }
+};
+
+const creditsFile = path.join(ROOT, 'config/credits.json');
+
+function readCredits() {
+    let data = {};
+    try {
+        data = JSON.parse(fs.readFileSync(creditsFile, 'utf8'));
+    } catch { /* missing file starts empty */ }
+    data.balances = data.balances || {};
+    data.processedSessions = data.processedSessions || {};
+    return data;
+}
+
+function writeCredits(data) {
+    fs.writeFileSync(creditsFile, JSON.stringify(data, null, 2));
+}
+
+function getCredits(username) {
+    return readCredits().balances[username] || 0;
+}
+
+// Returns false if this Stripe session was already credited (prevents double credit)
+function addCredits(username, amount, sessionId) {
+    const data = readCredits();
+    if (data.processedSessions[sessionId]) return false;
+    data.balances[username] = (data.balances[username] || 0) + amount;
+    data.processedSessions[sessionId] = new Date().toISOString();
+    writeCredits(data);
+    return true;
+}
+
+function useCredit(username) {
+    const data = readCredits();
+    if ((data.balances[username] || 0) < 1) return false;
+    data.balances[username] -= 1;
+    writeCredits(data);
+    return true;
+}
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
@@ -49,6 +103,42 @@ const upload = multer({
 });
 
 app.use(helmet({ contentSecurityPolicy: false }));
+
+// Webhook must come BEFORE express.json() because it needs the raw body
+app.post('/api/stripe-webhook',
+    express.raw({ type: 'application/json' }),
+    (req, res) => {
+        if (!stripe) return res.status(500).send('Stripe not configured');
+
+        let event;
+        try {
+            event = stripe.webhooks.constructEvent(
+                req.body,
+                req.headers['stripe-signature'],
+                process.env.STRIPE_WEBHOOK_SECRET
+            );
+        } catch (err) {
+            console.error('Webhook signature failed:', err.message);
+            return res.status(400).send('Webhook Error');
+        }
+
+        if (event.type === 'checkout.session.completed') {
+            const session = event.data.object;
+            const { username, packId } = session.metadata || {};
+            const pack = PACKS[packId];
+
+            if (session.payment_status === 'paid' && username && pack) {
+                const added = addCredits(username, pack.credits, session.id);
+                console.log(added
+                    ? `Added ${pack.credits} credits to ${username}`
+                    : `Session ${session.id} already processed`);
+            }
+        }
+
+        res.json({ received: true });
+    }
+);
+
 app.use(express.json({ limit: '1mb' }));
 
 app.use(session({
@@ -325,11 +415,96 @@ app.post('/api/login', loginLimiter, (req, res) => {
 });
 
 app.get('/api/me', (req, res) => {
-    res.json({ user: req.session.user || null });
+    const user = req.session.user || null;
+    res.json({ user, credits: user ? getCredits(user.username) : 0 });
 });
 
 app.post('/api/logout', requireAuth, (req, res) => {
     req.session.destroy(() => res.json({ ok: true }));
+});
+
+// --------------------------------------------------
+// PAYMENTS (Stripe test mode)
+// --------------------------------------------------
+
+app.get('/api/packs', requireAuth, (req, res) => {
+    res.json(Object.entries(PACKS).map(([id, p]) => ({
+        id, name: p.name, credits: p.credits, amountPkr: p.amountPkr
+    })));
+});
+
+app.post('/api/checkout', requireAuth, async (req, res) => {
+    if (!stripe) {
+        return res.status(500).json({ error: 'Stripe is not configured.' });
+    }
+
+    const pack = PACKS[req.body?.packId];
+    if (!pack) {
+        return res.status(400).json({ error: 'Unknown credit pack.' });
+    }
+
+    try {
+        const session = await stripe.checkout.sessions.create({
+            mode: 'payment',
+            line_items: [{
+                quantity: 1,
+                price_data: {
+                    currency: 'pkr',
+                    unit_amount: pack.amountPkr * 100, // minor units (paisa)
+                    product_data: { name: `ClaimProof: ${pack.name}` }
+                }
+            }],
+            metadata: {
+                username: req.session.user.username,
+                packId: req.body.packId
+            },
+            // {CHECKOUT_SESSION_ID} is filled in by Stripe
+            success_url: `${APP_URL}/?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${APP_URL}/?payment=cancelled`
+        });
+
+        res.json({ url: session.url });
+    } catch (err) {
+        console.error('Stripe checkout failed:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Called by the browser after Stripe redirects back. Verifies the payment
+// directly with Stripe, so it works even without the webhook.
+// Duplicate crediting is prevented by processedSessions.
+app.post('/api/confirm-payment', requireAuth, async (req, res) => {
+    if (!stripe) {
+        return res.status(500).json({ error: 'Stripe is not configured.' });
+    }
+
+    const sessionId = req.body?.sessionId;
+    if (typeof sessionId !== 'string' || !sessionId.startsWith('cs_')) {
+        return res.status(400).json({ error: 'Invalid session id.' });
+    }
+
+    try {
+        const s = await stripe.checkout.sessions.retrieve(sessionId);
+        const { username, packId } = s.metadata || {};
+        const pack = PACKS[packId];
+
+        if (s.payment_status !== 'paid' || !pack ||
+            username !== req.session.user.username) {
+            return res.status(400).json({
+                error: 'Payment not completed, or it belongs to another account.'
+            });
+        }
+
+        const added = addCredits(username, pack.credits, s.id);
+        console.log(added
+            ? `Confirmed payment: added ${pack.credits} credits to ${username}`
+            : `Session ${s.id} was already credited`);
+
+        res.json({ credits: getCredits(username) });
+    } catch (err) {
+        console.error('Confirm payment failed:', err.message);
+        res.status(500).json({ error: 'Could not verify the payment.' });
+    }
 });
 
 // --------------------------------------------------
@@ -371,6 +546,14 @@ app.post('/api/analyze', requireAuth, upload.single('image'), async (req, res) =
         });
     }
 
+    const username = req.session.user.username;
+
+    if (getCredits(username) < 1) {
+        return res.status(402).json({
+            error: 'No credits left. Please buy a credit pack to continue.'
+        });
+    }
+
     try {
 
         const FormData = require('form-data');
@@ -406,6 +589,10 @@ app.post('/api/analyze', requireAuth, upload.single('image'), async (req, res) =
             originalName: req.file.originalname,
             photoBuffer: result.processed_image.split(',')[1]
         };
+
+        // Charge one credit only after a successful analysis.
+        useCredit(username);
+        result.credits_left = getCredits(username);
 
         // STEP 4: Return results to the frontend.
         res.json(result);
